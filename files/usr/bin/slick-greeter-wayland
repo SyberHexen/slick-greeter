@@ -63,6 +63,16 @@ new_socket() {
     return 1
 }
 
+# SDR colors in their own gamut on wide gamut monitors, as on a desktop
+# with MUFFIN_SDR_EDID_COLORS=1 (sdr-edid-colors, set in lightdm-settings)
+sdr_colors=$(sed -n 's/^[[:space:]]*sdr-edid-colors[[:space:]]*=[[:space:]]*//p' \
+    /etc/lightdm/slick-greeter.conf 2>/dev/null | tail -n 1)
+if [ "$sdr_colors" = true ]; then
+    export MUFFIN_SDR_EDID_COLORS=1
+else
+    unset MUFFIN_SDR_EDID_COLORS
+fi
+
 # Muffin doesn't get LightDM's greeter pipes, so it can't hold them open.
 (
     [ -n "$LIGHTDM_TO_SERVER_FD" ] && eval "exec $LIGHTDM_TO_SERVER_FD>&-"
