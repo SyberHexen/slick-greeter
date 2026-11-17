@@ -1,0 +1,104 @@
+#!/bin/sh
+# Run slick-greeter as a Wayland greeter: start Muffin as the display server,
+# run the greeter in it, and stop Muffin when the greeter exits.
+#
+# LightDM runs this for the slick-greeter-wayland greeter session
+# (X-LightDM-Session-Type=wayland), on the greeter's VT and logind session.
+
+log() {
+    echo "slick-greeter-wayland: $*" >&2
+}
+
+# Muffin and the greeter need a session bus.
+if [ -z "$DBUS_SESSION_BUS_ADDRESS" ]; then
+    if [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+    else
+        log "no session bus yet, starting one"
+        exec dbus-run-session -- "$0" "$@"
+    fi
+fi
+
+unset DISPLAY WAYLAND_DISPLAY
+
+# Numlock: slick-greeter's activate-numlock uses numlockx, an X11 tool. On
+# Wayland Muffin sets numlock as it starts, from the lightdm user's keyboard
+# settings, so turn it on there -- once: Muffin remembers the state from then
+# on, and setting it on every start would first start this user's D-Bus and
+# dconf while the screen waits.
+numlock=$(sed -n 's/^[[:space:]]*activate-numlock[[:space:]]*=[[:space:]]*//p' \
+    /etc/lightdm/slick-greeter.conf 2>/dev/null | tail -n 1)
+numlock_stamp="${XDG_CACHE_HOME:-$HOME/.cache}/slick-greeter-wayland-numlock"
+if [ "$numlock" = true ]; then
+    if [ ! -e "$numlock_stamp" ]; then
+        gsettings set org.cinnamon.desktop.peripherals.keyboard remember-numlock-state true &&
+        gsettings set org.cinnamon.desktop.peripherals.keyboard numlock-state true &&
+        mkdir -p "${numlock_stamp%/*}" && : > "$numlock_stamp"
+        log "numlock turned on"
+    fi
+else
+    rm -f "$numlock_stamp"
+fi
+
+export XDG_SESSION_TYPE=wayland
+
+# Muffin takes the first wayland-N socket whose lock file isn't held, which
+# can be one that a compositor that has exited left behind. Its socket is the
+# one whose lock is held now and wasn't before.
+held_sockets() {
+    for lock in "$XDG_RUNTIME_DIR"/wayland-*.lock; do
+        [ -e "$lock" ] || continue
+        flock -n "$lock" true 2>/dev/null || echo "${lock%.lock}"
+    done
+}
+held_before=" $(held_sockets | tr '\n' ' ') "
+
+new_socket() {
+    for path in $(held_sockets); do
+        case "$held_before" in
+            *" $path "*) ;;
+            *) [ -S "$path" ] && echo "${path##*/}" && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Muffin doesn't get LightDM's greeter pipes, so it can't hold them open.
+(
+    [ -n "$LIGHTDM_TO_SERVER_FD" ] && eval "exec $LIGHTDM_TO_SERVER_FD>&-"
+    [ -n "$LIGHTDM_FROM_SERVER_FD" ] && eval "exec $LIGHTDM_FROM_SERVER_FD<&-"
+    unset LIGHTDM_TO_SERVER_FD LIGHTDM_FROM_SERVER_FD
+    exec muffin --wayland --display-server --no-x11 --sm-disable
+) &
+muffin_pid=$!
+
+greeter_pid=
+
+stop_muffin() {
+    [ -n "$greeter_pid" ] && kill -TERM "$greeter_pid" 2>/dev/null
+    kill -TERM "$muffin_pid" 2>/dev/null
+    wait "$muffin_pid" 2>/dev/null
+}
+
+trap 'stop_muffin; exit 0' TERM INT HUP
+
+# Wait up to 10 seconds for Muffin's socket.
+i=0
+while ! socket=$(new_socket); do
+    if ! kill -0 "$muffin_pid" 2>/dev/null || [ $i -ge 500 ]; then
+        log "Muffin didn't start"
+        stop_muffin
+        exit 1
+    fi
+    sleep 0.02
+    i=$((i + 1))
+done
+
+export WAYLAND_DISPLAY="$socket" GDK_BACKEND=wayland
+slick-greeter "$@" &
+greeter_pid=$!
+wait "$greeter_pid"
+status=$?
+
+stop_muffin
+exit $status
