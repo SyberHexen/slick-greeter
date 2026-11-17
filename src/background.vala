@@ -494,6 +494,9 @@ public class Background : Gtk.Fixed
 
     private List<Monitor> monitors = null;
     private Monitor? active_monitor = null;
+    private bool drawn = false;
+    private int made_width = -1;
+    private int made_height = -1;
 
     private AnimateTimer timer;
 
@@ -583,6 +586,17 @@ public class Background : Gtk.Fixed
         queue_draw ();
     }
 
+    public bool is_ready ()
+    {
+        if (current == null || !current.load ())
+            return false;
+
+        if (current.filename != current_background)
+            return false;
+
+        return current_background != fallback_color || system_background == fallback_color;
+    }
+
     public void set_active_monitor (Monitor? monitor)
     {
         active_monitor = monitor;
@@ -616,9 +630,22 @@ public class Background : Gtk.Fixed
 
         base.size_allocate (allocation);
 
-        /* Regenerate backgrounds */
-        if (resized)
+        /* Regenerate backgrounds when the monitors they were made for have
+           changed (the window covers them): not for every new window size,
+           such as a Wayland window getting its first sizes after its
+           background was loaded before it was shown, which would throw the
+           loaded background away and show its color while it loads again */
+        /* (Loaded before the first size, as on Wayland: made for these) */
+        if (made_width < 0 && current != null && current.load ())
         {
+            made_width = width;
+            made_height = height;
+        }
+
+        if (resized && (width != made_width || height != made_height))
+        {
+            made_width = width;
+            made_height = height;
             debug ("Regenerating backgrounds");
             loaders.remove_all ();
             load_background (null);
@@ -648,6 +675,15 @@ public class Background : Gtk.Fixed
                 old = new_background;
             current = new_background;
             publish_average_color ();
+        }
+
+        /* The first time it's drawn the background just appears: there is
+           nothing on screen yet to fade from */
+        if (!drawn)
+        {
+            drawn = true;
+            if (current.load ())
+                old = current;
         }
 
         /* Fade to this background when loaded */
@@ -863,7 +899,8 @@ public class Background : Gtk.Fixed
     {
         notify_property ("average-color");
 
-        if (!SlickGreeter.singleton.test_mode)
+        /* (An X11 root window property: there is none on Wayland) */
+        if (!SlickGreeter.singleton.test_mode && !SlickGreeter.is_wayland ())
         {
             var rgba = current.average_color.to_string ();
             var root = get_screen ().get_root_window ();
