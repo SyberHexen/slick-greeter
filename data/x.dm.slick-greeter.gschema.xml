@@ -139,6 +139,11 @@
       <default>false</default>
       <summary>Whether to activate numlock. This features requires the installation of numlockx.</summary>
     </key>
+    <key name="sdr-edid-colors" type="b">
+      <default>false</default>
+      <summary>Whether the Wayland login window shows SDR colors in their own gamut on wide gamut monitors</summary>
+      <description>On monitors whose EDID describes a wider gamut than sRGB, Muffin converts the colors to the monitor's primaries instead of letting the monitor stretch them, as the desktop does with MUFFIN_SDR_EDID_COLORS=1. Matching the desktop also keeps logging in from changing the monitors' colors.</description>
+    </key>
     <key name="only-on-monitor" type="s">
       <default>'auto'</default>
       <summary>Monitor on which to show the GUI</summary>
