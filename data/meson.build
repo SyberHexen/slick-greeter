@@ -39,7 +39,7 @@ install_data(
 )
 
 install_data(
-    'slick-greeter.desktop',
+    ['slick-greeter.desktop', 'slick-greeter-wayland.desktop'],
     install_dir: datadir / 'xgreeters',
 )
 

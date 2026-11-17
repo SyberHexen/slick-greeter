@@ -27,6 +27,13 @@ public class MainWindow : Gtk.Window
     private Monitor active_monitor;
     private string only_on_monitor;
     private bool monitor_setting_ok;
+    /* On Wayland: the monitor the window is fullscreen on, the monitor the
+       pointer moved the login box to (with only-on-monitor auto), and the
+       background windows on the other monitors */
+    private int wayland_monitor = -1;
+    private string? wayland_pointer_monitor = null;
+    private List<OtherMonitorWindow> other_monitor_windows = null;
+    private bool windows_shown = false;
     private Background background;
     private Gtk.Box login_box;
     private Gtk.Box hbox;
@@ -172,7 +179,9 @@ public class MainWindow : Gtk.Window
         only_on_monitor = UGSettings.get_string(UGSettings.KEY_ONLY_ON_MONITOR);
         monitor_setting_ok = only_on_monitor == "auto";
 
-        if (SlickGreeter.singleton.test_mode)
+        /* (On Wayland the test window is the real one: a Wayland client can't
+           place or span a window over simulated monitors) */
+        if (SlickGreeter.singleton.test_mode && !SlickGreeter.is_wayland ())
         {
             /* Simulate an 800x600 monitor to the left of a 640x480 monitor */
             monitors = new List<Monitor> ();
@@ -237,6 +246,34 @@ public class MainWindow : Gtk.Window
         background.set_surface (get_window ().create_similar_surface (Cairo.Content.COLOR, 1, 1));
     }
 
+    /* Start loading the system background before the window is shown (the
+       user list sets the background once it is shown) */
+    public void show_all_when_ready (owned SlickGreeter.ShownFunc shown)
+    {
+        SlickGreeter.show_when_ready (this, () => {
+            var ready = is_background_ready ();
+            foreach (var w in other_monitor_windows)
+                ready = w.is_background_ready () && ready;
+            return ready;
+        }, () => {
+            windows_shown = true;
+            foreach (var w in other_monitor_windows)
+                w.show ();
+            shown ();
+        });
+    }
+
+    public bool is_background_ready ()
+    {
+        if (!background.get_realized ())
+            background.realize ();
+        if (background.current_background == background.fallback_color &&
+            background.system_background != background.fallback_color)
+            background.current_background = null;
+
+        return background.is_ready ();
+    }
+
     public void before_session_start()
     {
         debug ("Killing orca and onboard");
@@ -246,14 +283,154 @@ public class MainWindow : Gtk.Window
     /* Setup the size and position of the window */
     public void setup_window ()
     {
+        if (SlickGreeter.is_wayland ())
+        {
+            /* A Wayland client can't place a window or span one over several
+               monitors: be fullscreen on the chosen one */
+            resize (background.width, background.height);
+            if (wayland_monitor >= 0)
+                fullscreen_on_monitor (get_screen (), wayland_monitor);
+            else
+                fullscreen ();
+            move_to_monitor (primary_monitor);
+            return;
+        }
+
         resize (background.width, background.height);
         move (0, 0);
         move_to_monitor (primary_monitor);
     }
 
+    /* The name in a monitor's EDID (its monitor name descriptor), which is
+       what GDK's monitor model is on Wayland; only-on-monitor names the
+       connector, as on X11 (DP-1), so it is looked up through sysfs */
+    private static string? edid_name_for_connector (string connector)
+    {
+        try
+        {
+            var dir = Dir.open ("/sys/class/drm");
+            string? entry;
+
+            while ((entry = dir.read_name ()) != null)
+            {
+                /* card1-DP-1 */
+                var dash = entry.index_of ("-");
+                if (!entry.has_prefix ("card") || dash < 0 || entry.substring (dash + 1) != connector)
+                    continue;
+
+                uint8[] edid;
+                FileUtils.get_data (Path.build_filename ("/sys/class/drm", entry, "edid"), out edid);
+
+                for (var offset = 54; offset + 18 <= edid.length && offset <= 108; offset += 18)
+                {
+                    if (edid[offset] == 0 && edid[offset + 1] == 0 && edid[offset + 2] == 0 && edid[offset + 3] == 0xfc)
+                    {
+                        var name = new StringBuilder ();
+                        for (var i = offset + 5; i < offset + 18 && edid[i] != 10; i++)
+                            name.append_c ((char) edid[i]);
+                        return name.str.strip ();
+                    }
+                }
+            }
+        }
+        catch (Error e)
+        {
+            debug ("Could not read the EDID of %s: %s", connector, e.message);
+        }
+
+        return null;
+    }
+
+    private void wayland_monitors_changed (Gdk.Display display)
+    {
+        var edid_name = only_on_monitor == "auto" ? null : edid_name_for_connector (only_on_monitor);
+
+        wayland_monitor = -1;
+        for (var i = 0; i < display.get_n_monitors (); i++)
+        {
+            var model = display.get_monitor (i).get_model ();
+            if (model != null && (model == only_on_monitor || model == edid_name))
+            {
+                wayland_monitor = i;
+                monitor_setting_ok = true;
+                break;
+            }
+        }
+        /* Otherwise the one the pointer moved it to, or as there is no
+           primary monitor on Wayland, the first one */
+        for (var i = 0; wayland_monitor < 0 && wayland_pointer_monitor != null && i < display.get_n_monitors (); i++)
+        {
+            if (display.get_monitor (i).get_model () == wayland_pointer_monitor)
+                wayland_monitor = i;
+        }
+        if (wayland_monitor < 0 && display.get_n_monitors () > 0)
+            wayland_monitor = 0;
+
+        monitors = new List<Monitor> ();
+        primary_monitor = null;
+        if (wayland_monitor >= 0)
+        {
+            var geometry = display.get_monitor (wayland_monitor).get_geometry ();
+            debug ("Wayland: using monitor %d (%s), %dx%d", wayland_monitor,
+                   display.get_monitor (wayland_monitor).get_model (), geometry.width, geometry.height);
+
+            /* The window is that monitor alone */
+            primary_monitor = new Monitor (0, 0, geometry.width, geometry.height);
+            monitors.append (primary_monitor);
+        }
+
+        background.set_monitors (monitors);
+
+        foreach (var w in other_monitor_windows)
+            w.destroy ();
+        other_monitor_windows = new List<OtherMonitorWindow> ();
+        for (var i = 0; i < display.get_n_monitors (); i++)
+        {
+            if (i == wayland_monitor)
+                continue;
+
+            var w = new OtherMonitorWindow (display, i, background, windows_shown);
+            w.entered.connect (wayland_pointer_entered);
+            other_monitor_windows.append (w);
+        }
+
+        if (do_resize)
+            setup_window ();
+        else
+            do_resize = true;
+    }
+
+    /* The pointer moved to another monitor: move the login box there, as on
+       X11, unless only-on-monitor names a monitor that is connected */
+    private void wayland_pointer_entered (OtherMonitorWindow w)
+    {
+        if (monitor_setting_ok && only_on_monitor != "auto")
+            return;
+
+        var display = get_display ();
+        if (w.monitor_index >= display.get_n_monitors ())
+            return;
+
+        wayland_pointer_monitor = display.get_monitor (w.monitor_index).get_model ();
+        do_resize = true;
+        /* (After this event: it destroys the window it came from) */
+        Idle.add (() => {
+            wayland_monitors_changed (get_display ());
+            present ();
+            return false;
+        });
+    }
+
     private void monitors_changed_cb (Gdk.Screen screen)
     {
         Gdk.Display display = screen.get_display();
+
+        if (SlickGreeter.is_wayland ())
+        {
+            wayland_monitors_changed (display);
+            return;
+        }
+
         Gdk.Monitor primary = display.get_primary_monitor();
         Gdk.Rectangle geometry;
 
@@ -501,5 +678,98 @@ public class MainWindow : Gtk.Window
         shutdown_dialog = null;
 
         login_box.sensitive = true;
+    }
+}
+
+/* On Wayland: the background on a monitor the login box isn't on, in a
+   fullscreen window of its own */
+private class OtherMonitorWindow : Gtk.Window
+{
+    public int monitor_index { get; private set; }
+    public signal void entered (OtherMonitorWindow window);
+
+    private Background background;
+    private Background main_background;
+    private ulong main_background_handler;
+
+    public OtherMonitorWindow (Gdk.Display display, int monitor_index, Background main_background, bool show_now)
+    {
+        this.monitor_index = monitor_index;
+        this.main_background = main_background;
+
+        decorated = false;
+        accept_focus = false;
+        focus_on_map = false;
+        add_events (Gdk.EventMask.ENTER_NOTIFY_MASK);
+
+        /* The main window's background color, shown until the background is
+           drawn (instead of the theme's window color, white with Adwaita) */
+        var bg_color = Gdk.RGBA ();
+        if (!bg_color.parse (UGSettings.get_string (UGSettings.KEY_BACKGROUND_COLOR)))
+            bg_color.parse ("#000000");
+        try
+        {
+            var bg_provider = new Gtk.CssProvider ();
+            bg_provider.load_from_data ("window { background-color: %s; }".printf (bg_color.to_string ()), -1);
+            get_style_context ().add_provider (bg_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+        }
+        catch (Error e)
+        {
+            debug ("Internal error setting background color: %s", e.message);
+        }
+
+        var geometry = display.get_monitor (monitor_index).get_geometry ();
+        var monitors = new List<Monitor> ();
+        monitors.append (new Monitor (0, 0, geometry.width, geometry.height));
+
+        background = new Background ();
+        SlickGreeter.add_style_class (background);
+        background.set_monitors (monitors);
+        add (background);
+        set_default_size (geometry.width, geometry.height);
+
+        /* Follow the main window's background, which changes with the
+           selected user */
+        main_background_handler = main_background.notify["current-background"].connect (() => {
+            background.current_background = main_background.current_background;
+        });
+
+        realize ();
+        background.current_background = main_background.current_background;
+        fullscreen_on_monitor (get_screen (), monitor_index);
+        if (show_now)
+            SlickGreeter.show_when_ready (this, () => is_background_ready ());
+    }
+
+    public bool is_background_ready ()
+    {
+        if (!background.get_realized ())
+        {
+            background.realize ();
+            background.current_background = main_background.current_background;
+        }
+        return background.is_ready ();
+    }
+
+    public override void realize ()
+    {
+        base.realize ();
+        background.set_surface (get_window ().create_similar_surface (Cairo.Content.COLOR, 1, 1));
+    }
+
+    public override void destroy ()
+    {
+        if (main_background_handler != 0)
+        {
+            main_background.disconnect (main_background_handler);
+            main_background_handler = 0;
+        }
+        base.destroy ();
+    }
+
+    public override bool enter_notify_event (Gdk.EventCrossing event)
+    {
+        entered (this);
+        return false;
     }
 }
