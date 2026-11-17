@@ -1,0 +1,174 @@
+#!/bin/sh
+# Gives the Wayland login window the users' display settings. LightDM runs
+# this as root before each greeter session (greeter-setup-script); the
+# lightdm user's Muffin then shows the login window with them.
+#
+# Muffin keeps one configuration (arrangement, resolution, refresh rate,
+# scale, HDR) per set of monitors and uses the one for the monitors that are
+# connected. This merges the users' configurations into the lightdm user's
+# file: for each set of monitors, the one of the user who logged in last, or
+# else the most recently saved one. The Wayland settings come from Cinnamon
+# on Wayland; the X11 ones (Cinnamon on X11) are used where they convert
+# exactly. Monitors without a configuration get Muffin's defaults.
+#
+# The users' files are read with their own permissions, a size and time
+# limit, and only plain monitor settings are taken from them. This never
+# fails: the login window must start.
+
+config=cinnamon-monitors-wayland.xml
+x11_config=cinnamon-monitors.xml
+max_size=1048576
+
+greeter_home=$(getent passwd lightdm | cut -d: -f6)
+[ -n "$greeter_home" ] && [ -d "$greeter_home" ] || exit 0
+target="$greeter_home/.config/$config"
+
+work=$(mktemp -d) || exit 0
+trap 'rm -rf "$work"' EXIT
+trap 'exit 0' HUP INT TERM
+
+login_defs() {
+    awk -v key="$1" '$1 == key { print $2; exit }' /etc/login.defs 2>/dev/null
+}
+uid_min=$(login_defs UID_MIN)
+uid_max=$(login_defs UID_MAX)
+
+# The user who logged in last (slick-greeter remembers them per seat)
+state=state
+[ -n "$XDG_SEAT" ] && [ "$XDG_SEAT" != seat0 ] && state="$XDG_SEAT-state"
+last_user=$(sed -n 's/^last-user=//p' "$greeter_home/.cache/slick-greeter/$state" 2>/dev/null | head -n 1)
+
+# read_as UID GID FILE OUT: copies FILE as the user, after a line with its
+# modification time
+read_as() {
+    timeout 5 setpriv --reuid="$1" --regid="$2" --init-groups --reset-env -- \
+        sh -c '[ -f "$1" ] && [ -r "$1" ] || exit 1
+               stat -L -c %Y -- "$1" && head -c "$2" -- "$1"' \
+        sh "$3" "$max_size" > "$4" 2>/dev/null
+}
+
+# Each found file as "<last user?> <time> <type> <copy>"
+getent passwd | while IFS=: read -r name _ uid gid _ home _; do
+    [ "$uid" -ge "${uid_min:-1000}" ] 2>/dev/null &&
+        [ "$uid" -le "${uid_max:-60000}" ] 2>/dev/null || continue
+    [ -n "$home" ] && [ "$home" != / ] || continue
+    last=0
+    [ "$name" = "$last_user" ] && last=1
+    for type in wayland x11; do
+        file="$home/.config/$config"
+        [ $type = x11 ] && file="$home/.config/$x11_config"
+        copy="$work/$type.$uid"
+        if read_as "$uid" "$gid" "$file" "$copy"; then
+            echo "$last $(head -n 1 "$copy") $type $copy"
+        fi
+    done
+done | sort -k1,1nr -k2,2nr > "$work/list"
+
+[ -s "$work/list" ] || exit 0
+
+set --
+while read -r _ _ type copy; do
+    set -- "$@" "type=$type" "$copy"
+done < "$work/list"
+
+awk '
+FNR == 1 { next }   # (the modification time)
+
+{
+    line = $0
+    gsub(/^[ \t]+|[ \t\r]+$/, "", line)
+}
+
+line == "<configuration>" {
+    in_config = 1; ok = 1; n_lines = 0; n_specs = 0
+    in_spec = 0; scale = ""; uniform = 1
+    next
+}
+
+!in_config { next }
+
+line == "</configuration>" {
+    in_config = 0
+    if (!ok || n_specs == 0)
+        next
+
+    # The set of monitors it is for: its monitor specs, sorted
+    for (i = 2; i <= n_specs; i++)
+        for (j = i; j > 1 && specs[j - 1] > specs[j]; j--) {
+            t = specs[j]; specs[j] = specs[j - 1]; specs[j - 1] = t
+        }
+    key = ""
+    for (i = 1; i <= n_specs; i++)
+        key = key "|" specs[i]
+    if (key in seen)
+        next
+
+    # X11 positions are in pixels: with one scale for all monitors they are
+    # the Wayland (logical) positions times that scale
+    if (type == "x11") {
+        if (scale == "")
+            scale = 1
+        if (!uniform)
+            next
+        for (i = 1; i <= n_lines; i++) {
+            if (lines[i] !~ /<[xy]>/)
+                continue
+            value = lines[i]
+            gsub(/.*<[xy]>|<\/[xy]>.*/, "", value)
+            position = value / scale
+            if (position != int(position))
+                next
+            tag = substr(lines[i], index(lines[i], "<") + 1, 1)
+            indent = lines[i]
+            sub(/<.*/, "", indent)
+            lines[i] = indent "<" tag ">" sprintf("%d", position) "</" tag ">"
+        }
+    }
+
+    seen[key] = 1
+    out = out "  <configuration>\n"
+    for (i = 1; i <= n_lines; i++)
+        out = out lines[i] "\n"
+    out = out "  </configuration>\n"
+    next
+}
+
+{
+    # Only plain elements: one tag, or one element with text
+    if (line !~ /^<\/?[a-z]+>$/ && line !~ /^<[a-z]+>[^<>]*<\/[a-z]+>$/) {
+        ok = 0
+        next
+    }
+    lines[++n_lines] = $0
+
+    if (line == "<monitorspec>") {
+        in_spec = 1; spec = ""
+    } else if (line == "</monitorspec>") {
+        in_spec = 0; specs[++n_specs] = spec
+    } else if (in_spec) {
+        spec = spec line
+    } else if (line ~ /^<scale>/) {
+        value = line
+        gsub(/<\/?scale>/, "", value)
+        if (scale == "")
+            scale = value + 0
+        else if (value + 0 != scale)
+            uniform = 0
+        if (scale <= 0)
+            ok = 0
+    }
+}
+
+END {
+    if (out != "")
+        printf "<monitors version=\"2\">\n%s</monitors>\n", out
+}
+' "$@" > "$work/merged" 2>/dev/null
+
+[ -s "$work/merged" ] || exit 0
+cmp -s "$work/merged" "$target" 2>/dev/null && exit 0
+
+install -d -o lightdm -g lightdm "$greeter_home/.config" 2>/dev/null &&
+    install -m 644 -o lightdm -g lightdm "$work/merged" "$target" 2>/dev/null
+
+exit 0
