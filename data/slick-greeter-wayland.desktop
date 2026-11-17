@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Slick Greeter (Wayland)
+Comment=Slick Greeter on Wayland, in Muffin
+Exec=slick-greeter-wayland
+Type=Application
+X-LightDM-Session-Type=wayland
+X-Ubuntu-Gettext-Domain=slick-greeter

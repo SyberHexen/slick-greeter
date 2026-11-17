@@ -314,9 +314,36 @@ public class SlickGreeter
         debug ("Showing main window");
         main_window.realize ();
         main_window.setup_window();
-        main_window.show ();
-        main_window.get_window ().focus (Gdk.CURRENT_TIME);
-        main_window.set_keyboard_state ();
+        main_window.show_all_when_ready (() => {
+            main_window.get_window ().focus (Gdk.CURRENT_TIME);
+            main_window.set_keyboard_state ();
+        });
+    }
+
+    public delegate bool ReadyFunc ();
+    public delegate void ShownFunc ();
+
+    public static void show_when_ready (Gtk.Window window, owned ReadyFunc ready, owned ShownFunc? shown = null)
+    {
+        if (!is_wayland () || ready ())
+        {
+            window.show ();
+            if (shown != null)
+                shown ();
+            return;
+        }
+
+        var timer = new Timer ();
+        Timeout.add (10, () => {
+            if (!ready () && timer.elapsed () < 1.0)
+                return true;
+            debug ("Showing %s after %.0f ms (background %s)", window.get_type ().name (),
+                   timer.elapsed () * 1000, ready () ? "ready" : "not ready");
+            window.show ();
+            if (shown != null)
+                shown ();
+            return false;
+        });
     }
 
     public bool is_authenticated ()
@@ -532,8 +559,22 @@ public class SlickGreeter
         return Gdk.FilterReturn.CONTINUE;
     }
 
+    /* Running as a Wayland client, as under a compositor that LightDM starts
+       for a greeter session of type wayland (X-LightDM-Session-Type=wayland).
+       Decided from the environment, as it is needed before GTK opens its
+       display: the X11 helpers below run first. */
+    public static bool is_wayland ()
+    {
+        return Environment.get_variable ("WAYLAND_DISPLAY") != null &&
+               Environment.get_variable ("GDK_BACKEND") != "x11";
+    }
+
     private void start_fake_wm ()
     {
+        /* On Wayland the compositor gives new windows focus */
+        if (is_wayland ())
+            return;
+
         /* We want new windows (e.g. the shutdown dialog) to gain focus.
            We don't really need anything more than that (don't need alt-tab
            since any dialog should be "modal" or at least dealt with before
@@ -732,26 +773,34 @@ public class SlickGreeter
         var hidpi = UGSettings.get_string (UGSettings.KEY_ENABLE_HIDPI);
         var cursor_scale = 1;
         debug ("HiDPI support: %s", hidpi);
-        if (hidpi == "auto") {
-            if (check_hidpi ())
+
+        /* On Wayland the compositor sets the scale, the keyboard layout,
+           numlock and touchpads (these helpers are X11 tools) */
+        if (is_wayland ()) {
+            debug ("Running on Wayland");
+        }
+        else {
+            if (hidpi == "auto") {
+                if (check_hidpi ())
+                    cursor_scale = 2;
+            }
+            else if (hidpi == "on") {
+                GLib.Environment.set_variable ("GDK_SCALE", "2", true);
                 cursor_scale = 2;
-        }
-        else if (hidpi == "on") {
-            GLib.Environment.set_variable ("GDK_SCALE", "2", true);
-            cursor_scale = 2;
-        }
+            }
 
-        /* Set the keyboard layout */
-        set_keyboard_layout ();
+            /* Set the keyboard layout */
+            set_keyboard_layout ();
 
-        /* Set the numlock state */
-        if (UGSettings.get_boolean (UGSettings.KEY_ACTIVATE_NUMLOCK)) {
-            debug ("Activating numlock");
-            activate_numlock ();
+            /* Set the numlock state */
+            if (UGSettings.get_boolean (UGSettings.KEY_ACTIVATE_NUMLOCK)) {
+                debug ("Activating numlock");
+                activate_numlock ();
+            }
+
+            /* Enable touchpad tap-to-click */
+            enable_tap_to_click ();
         }
-
-        /* Enable touchpad tap-to-click */
-        enable_tap_to_click ();
 
         Gtk.init (ref args);
 
