@@ -29,6 +29,11 @@ class BackgroundLoader : Object
     public Gdk.RGBA average_color;
 
     private Cairo.Surface target_surface;
+    /* The window's scale: the pictures are made at its pixel size, as a
+       picture made at the logical size would be stretched (and look of a
+       lower resolution) on a scaled monitor */
+    private double scale_x = 1.0;
+    private double scale_y = 1.0;
     private Thread<void*> thread;
     private Gdk.Pixbuf[] images;
     private bool finished;
@@ -39,6 +44,7 @@ class BackgroundLoader : Object
     public BackgroundLoader (Cairo.Surface target_surface, string filename, int[] widths, int[] heights)
     {
         this.target_surface = target_surface;
+        target_surface.get_device_scale (out scale_x, out scale_y);
         this.filename = filename;
         this.widths = widths;
         this.heights = heights;
@@ -126,7 +132,7 @@ class BackgroundLoader : Object
         {
             if (images[i] != null)
             {
-                patterns[i] = create_pattern (images[i]);
+                patterns[i] = create_pattern (images[i], widths[i], heights[i]);
                 if (i == 0)
                     pixbuf_average_value (images[i], out average_color);
                 images[i] = null;
@@ -150,7 +156,8 @@ class BackgroundLoader : Object
         {
             var image = new Gdk.Pixbuf.from_file (filename);
             for (var i = 0; i < widths.length; i++)
-                images[i] = scale (image, widths[i], heights[i]);
+                images[i] = scale (image, (int) Math.ceil (widths[i] * scale_x),
+                                   (int) Math.ceil (heights[i] * scale_y));
         }
         catch (Error e)
         {
@@ -186,23 +193,26 @@ class BackgroundLoader : Object
         return scaled_image;
     }
 
-    private Cairo.Pattern? create_pattern (Gdk.Pixbuf image)
+    private Cairo.Pattern? create_pattern (Gdk.Pixbuf image, int width, int height)
     {
-        var grid_x_offset = get_grid_offset (image.width);
-        var grid_y_offset = get_grid_offset (image.height);
+        var grid_x_offset = get_grid_offset (width);
+        var grid_y_offset = get_grid_offset (height);
 
-        /* Create background */
-        var surface = new Cairo.Surface.similar (target_surface, Cairo.Content.COLOR, image.width, image.height);
+        /* Create background: the surface has the window's scale, so the
+           picture, made at its pixel size, is drawn at one pixel per pixel */
+        var surface = new Cairo.Surface.similar (target_surface, Cairo.Content.COLOR, width, height);
         var bc = new Cairo.Context (surface);
+        bc.save ();
+        bc.scale ((double) width / image.width, (double) height / image.height);
         Gdk.cairo_set_source_pixbuf (bc, image, 0, 0);
-
         bc.paint ();
+        bc.restore ();
 
         /* Draw logo */
         if (logo != null)
         {
             bc.save ();
-            var y = (int) (image.height / grid_size - 2) * grid_size + grid_y_offset;
+            var y = (int) (height / grid_size - 2) * grid_size + grid_y_offset;
             bc.translate (grid_x_offset, y);
             bc.set_source_surface (logo, 0, 0);
             bc.paint_with_alpha (1.0);
