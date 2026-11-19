@@ -40,6 +40,9 @@ public class MainWindow : Gtk.Window
     private Gtk.Box content_box;
     private Gtk.Button back_button;
     private ShutdownDialog? shutdown_dialog = null;
+    private OnscreenKeyboard? onscreen_keyboard = null;
+    /* Shown because the screen was touched, not by the menu item */
+    private bool onscreen_keyboard_for_touch = false;
     private bool do_resize;
 
     public ListStack stack;
@@ -117,6 +120,24 @@ public class MainWindow : Gtk.Window
         content_box.expand = true;
         content_box.show ();
         login_box.add (content_box);
+
+        /* On Wayland the onscreen keyboard is the greeter's own, at the
+           bottom of the window (on X11 it is Onboard, in its own window) */
+        if (SlickGreeter.is_wayland ())
+        {
+            onscreen_keyboard = new OnscreenKeyboard ();
+            onscreen_keyboard.halign = Gtk.Align.CENTER;
+            onscreen_keyboard.hide_requested.connect (() => {
+                set_onscreen_keyboard_visible (false);
+                menubar.set_onscreen_keyboard_active (false);
+            });
+            login_box.add (onscreen_keyboard);
+            /* Every input event, before GTK handles it */
+            Gdk.Event.handler_set ((event) => {
+                touch_mode_event (event);
+                Gtk.main_do_event (event);
+            });
+        }
 
         var content_align = UGSettings.get_string(UGSettings.KEY_CONTENT_ALIGN);
 
@@ -237,6 +258,52 @@ public class MainWindow : Gtk.Window
             content_box.margin_end    = get_grid_offset (get_allocated_width ()) + (content_align == "right" ? grid_size : 0);
             content_box.margin_top = get_grid_offset (get_allocated_height ());
             content_box.margin_bottom = get_grid_offset (get_allocated_height ());
+        }
+
+        /* The keyboard takes the bottom third of the screen, at most about
+           the width of a real one; the request only changes with the size */
+        if (onscreen_keyboard != null)
+        {
+            var width = int.min (allocation.width, 1400) - onscreen_keyboard.margin * 2;
+            var height = allocation.height * 3 / 10;
+            int w, h;
+            onscreen_keyboard.get_size_request (out w, out h);
+            if (w != width || h != height)
+                onscreen_keyboard.set_size_request (width, height);
+        }
+    }
+
+    public void set_onscreen_keyboard_visible (bool visible)
+    {
+        onscreen_keyboard_for_touch = false;
+        if (onscreen_keyboard != null)
+            onscreen_keyboard.visible = visible;
+    }
+
+    /* As Cinnamon's and GNOME Shell's keyboards do, show the keyboard when
+       the screen is touched, for a touchscreen without a keyboard, and hide
+       it again when a real keyboard is used; the menu item's setting is
+       left as it is */
+    private void touch_mode_event (Gdk.Event event)
+    {
+        var type = event.get_event_type ();
+        var source = event.get_source_device ();
+
+        if (type == Gdk.EventType.TOUCH_BEGIN ||
+            (type == Gdk.EventType.BUTTON_PRESS && source != null &&
+             source.get_source () == Gdk.InputSource.TOUCHSCREEN))
+        {
+            if (!onscreen_keyboard.visible)
+            {
+                onscreen_keyboard.visible = true;
+                onscreen_keyboard_for_touch = true;
+            }
+        }
+        /* (The keyboard's own keys don't come through here) */
+        else if (type == Gdk.EventType.KEY_PRESS && onscreen_keyboard_for_touch)
+        {
+            onscreen_keyboard.visible = false;
+            onscreen_keyboard_for_touch = false;
         }
     }
 

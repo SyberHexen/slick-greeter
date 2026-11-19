@@ -164,6 +164,11 @@ public class MenuBar : Gtk.MenuBar
         onscreen_keyboard_item.set_active (UGSettings.get_boolean (UGSettings.KEY_ONSCREEN_KEYBOARD));
     }
 
+    public void set_onscreen_keyboard_active (bool active)
+    {
+        onscreen_keyboard_item.set_active (active);
+    }
+
     private string default_theme_name;
     private string clock_format;
     private Gtk.CheckMenuItem high_contrast_item;
@@ -625,6 +630,14 @@ public class MenuBar : Gtk.MenuBar
         /*settings.set_boolean ("screen-keyboard-enabled", item.active);*/
 
         UGSettings.set_boolean (UGSettings.KEY_ONSCREEN_KEYBOARD, item.active);
+
+        /* On Wayland there is no X server for Onboard: the greeter shows its
+           own keyboard */
+        if (SlickGreeter.is_wayland ())
+        {
+            main_window.set_onscreen_keyboard_visible (item.active);
+            return;
+        }
 
         if (keyboard_window == null)
         {
