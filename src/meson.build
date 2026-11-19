@@ -20,6 +20,7 @@ slick_greeter_sources = files(
     'main-window.vala',
     'menu.vala',
     'menubar.vala',
+    'onscreen-keyboard.vala',
     'prompt-box.vala',
     'session-list.vala',
     'remote-login-service.vala',
